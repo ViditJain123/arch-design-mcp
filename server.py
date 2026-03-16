@@ -40,9 +40,10 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from downloader import download_pdf
-from graph_downloader import download_from_sharepoint, _is_sharepoint_url
-from pdf_processor import (
+from .downloader import download_pdf
+from . import graph_auth
+from .graph_downloader import download_from_sharepoint, _is_sharepoint_url
+from .pdf_processor import (
     inspect_pdf, extract_pages_pdf, extract_pages_images,
     save_pages_pdf, save_pages_images, search_text, page_range,
 )
@@ -58,6 +59,9 @@ mcp = FastMCP(
         "IMPORTANT: When the user provides a URL or file path, call process_pdf "
         "directly with that exact input. Do NOT use Microsoft 365 tools to search "
         "for or re-fetch the file. "
+        "If a SharePoint URL fails with an authentication error, use o365_login_start "
+        "to begin sign-in, present the URL and code to the user, then call "
+        "o365_login_complete once they confirm they have signed in. "
         "Workflow: "
         "1) process_pdf(url) — returns session_id and total page count instantly. "
         "2) save_pages(session_id, start_page=1, end_page=10) — writes a sliced PDF "
@@ -109,6 +113,79 @@ def get_analysis_prompt() -> str:
     each architectural drawing page. Call this before analyzing pages.
     """
     return _ANALYSIS_PROMPT_PATH.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Tools: O365 Authentication
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def o365_auth_status() -> dict:
+    """
+    Check whether the user is currently authenticated to Office 365 / SharePoint.
+    Fast, no side effects — safe to call at any time.
+
+    Returns:
+        Dict with authenticated (bool) and username if authenticated.
+    """
+    try:
+        app, cache = graph_auth._get_app()
+        accounts = app.get_accounts()
+        if not accounts:
+            return {"authenticated": False}
+
+        result = app.acquire_token_silent(graph_auth._SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            graph_auth._save_cache(cache)
+            return {
+                "authenticated": True,
+                "username": accounts[0].get("username", "unknown"),
+            }
+
+        return {"authenticated": False, "reason": "token_expired"}
+    except Exception as e:
+        return {"authenticated": False, "error": str(e)}
+
+
+@mcp.tool()
+def o365_login_start() -> dict:
+    """
+    Start the Office 365 device code sign-in flow.
+    Returns a URL and code that the user must visit to authenticate.
+    After the user signs in, call o365_login_complete to finish.
+
+    Returns:
+        Dict with status, user_code, verification_uri_complete, and message.
+        If already authenticated, returns status="already_authenticated".
+    """
+    return graph_auth.initiate_device_code()
+
+
+@mcp.tool()
+async def o365_login_complete(timeout_seconds: int = 90) -> dict:
+    """
+    Wait for the user to complete the device code sign-in started by o365_login_start.
+    Blocks until the user finishes signing in or the timeout is reached.
+
+    Args:
+        timeout_seconds: Max seconds to wait (default 90).
+
+    Returns:
+        Dict with status ("authenticated", "timeout", or "error") and details.
+    """
+    return await graph_auth.complete_device_code(timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
+def o365_logout() -> dict:
+    """
+    Clear cached Office 365 tokens. The user will need to re-authenticate.
+
+    Returns:
+        Dict with confirmation message.
+    """
+    message = graph_auth.clear_cache()
+    return {"status": "logged_out", "message": message}
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ Token cache is stored locally at ~/.arch-design-mcp-token-cache.json
 so users only authenticate once.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -19,6 +20,11 @@ logger = logging.getLogger("arch-drawing-analyzer.graph_auth")
 _AUTHORITY_BASE = "https://login.microsoftonline.com"
 _SCOPES = ["Files.Read.All", "Sites.Read.All", "User.Read"]
 _CACHE_PATH = os.path.join(os.path.expanduser("~"), ".arch-design-mcp-token-cache.json")
+
+# Module-level state for pending device code flow (one at a time)
+_pending_flow = None
+_pending_app = None
+_pending_cache = None
 
 
 def _load_env() -> tuple[str, str]:
@@ -95,9 +101,8 @@ def get_access_token() -> str:
     if not accounts:
         raise RuntimeError(
             "Not authenticated to SharePoint. "
-            "Run this command in a terminal first:\n\n"
-            "  cd %LOCALAPPDATA%\\arch-design-mcp && uv run python -m graph_auth\n\n"
-            "Then retry the SharePoint link."
+            "Use the o365_login_start tool to begin sign-in, "
+            "then call o365_login_complete after signing in."
         )
 
     logger.info("Found cached account: %s", accounts[0].get("username", "unknown"))
@@ -112,10 +117,109 @@ def get_access_token() -> str:
     _save_cache(cache)
     raise RuntimeError(
         "SharePoint token expired and could not be refreshed. "
-        "Run this command in a terminal to re-authenticate:\n\n"
-        "  cd %LOCALAPPDATA%\\arch-design-mcp && uv run python -m graph_auth\n\n"
-        "Then retry the SharePoint link."
+        "Use the o365_login_start tool to re-authenticate, "
+        "then call o365_login_complete after signing in."
     )
+
+
+def initiate_device_code() -> dict:
+    """
+    Start a device code flow and return the URL+code immediately.
+    Stores flow state in module globals for complete_device_code() to finish.
+
+    If already authenticated (silent token works), returns early with status.
+
+    Returns:
+        Dict with status and either auth info or device code details.
+    """
+    global _pending_flow, _pending_app, _pending_cache
+
+    app, cache = _get_app()
+
+    # Check if already authenticated
+    accounts = app.get_accounts()
+    if accounts:
+        result = app.acquire_token_silent(_SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            _save_cache(cache)
+            return {
+                "status": "already_authenticated",
+                "username": accounts[0].get("username", "unknown"),
+            }
+
+    # Initiate device code flow
+    flow = app.initiate_device_flow(scopes=_SCOPES)
+    if "user_code" not in flow:
+        raise RuntimeError(
+            f"Device code flow failed: {flow.get('error_description', 'unknown error')}"
+        )
+
+    # Store state for complete_device_code()
+    _pending_flow = flow
+    _pending_app = app
+    _pending_cache = cache
+
+    return {
+        "status": "pending",
+        "user_code": flow["user_code"],
+        "verification_uri": flow.get("verification_uri", ""),
+        "verification_uri_complete": flow.get("verification_uri_complete", ""),
+        "message": flow.get("message", ""),
+        "expires_in": flow.get("expires_in", 900),
+    }
+
+
+async def complete_device_code(timeout_seconds: int = 90) -> dict:
+    """
+    Poll for device code flow completion. Blocks up to timeout_seconds.
+    Must be called after initiate_device_code().
+
+    Args:
+        timeout_seconds: Max seconds to wait (default 90, under MCP's ~120s limit).
+
+    Returns:
+        Dict with status and auth result.
+    """
+    global _pending_flow, _pending_app, _pending_cache
+
+    if _pending_flow is None or _pending_app is None:
+        raise RuntimeError(
+            "No pending device code flow. Call o365_login_start first."
+        )
+
+    flow = _pending_flow
+    app = _pending_app
+    cache = _pending_cache
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(app.acquire_token_by_device_flow, flow),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        # Abort MSAL's internal polling by expiring the flow
+        flow["expires_at"] = 0
+        _pending_flow = None
+        _pending_app = None
+        _pending_cache = None
+        return {
+            "status": "timeout",
+            "message": f"Sign-in not completed within {timeout_seconds}s. "
+                       "Call o365_login_start to try again.",
+        }
+
+    # Clear pending state
+    _pending_flow = None
+    _pending_app = None
+    _pending_cache = None
+
+    if "access_token" not in result:
+        error = result.get("error_description", result.get("error", "unknown error"))
+        return {"status": "error", "message": f"Authentication failed: {error}"}
+
+    _save_cache(cache)
+    username = result.get("id_token_claims", {}).get("preferred_username", "unknown")
+    return {"status": "authenticated", "username": username}
 
 
 def interactive_auth() -> str:

@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from graph_auth import get_access_token
+from .graph_auth import get_access_token
 
 logger = logging.getLogger("arch-drawing-analyzer.graph_downloader")
 
