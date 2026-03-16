@@ -1,11 +1,33 @@
 """
 MCP Server for Architectural Drawing Analysis.
 
-Exposes tools to download PDFs, split them into page images, and serve
-base64-encoded images back to Claude for vision-based analysis.
+Exposes tools to load PDFs, inspect metadata, and extract page ranges
+as native PDF content for Claude's vision-based analysis.
 
 Run: python -m mcp_server.server
 """
+import logging
+import sys
+ 
+# --- Configure logging ---------------------------------------------------
+# Level DEBUG = everything (request/response headers, URLs, redirects)
+# Level INFO  = key events (download start, redirect chain, validation)
+LOG_LEVEL = logging.DEBUG
+ 
+# Log to stderr so it doesn't interfere with MCP stdio transport
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(name)s] %(levelname)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
+ 
+# Quiet down httpx's own internal logging (very noisy at DEBUG)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+ 
+logger = logging.getLogger("arch-drawing-analyzer.server")
+# --------------------------------------------------------------------------
 
 import asyncio
 import atexit
@@ -18,8 +40,12 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .downloader import download_pdf
-from .pdf_processor import split_pdf, parse_page_range
+from downloader import download_pdf
+from graph_downloader import download_from_sharepoint, _is_sharepoint_url
+from pdf_processor import (
+    inspect_pdf, extract_pages_pdf, extract_pages_images,
+    save_pages_pdf, save_pages_images, search_text, page_range,
+)
 
 # ---------------------------------------------------------------------------
 # Server setup
@@ -28,9 +54,18 @@ from .pdf_processor import split_pdf, parse_page_range
 mcp = FastMCP(
     "arch-drawing-analyzer",
     instructions=(
-        "Architectural drawing PDF analyzer. Use process_pdf to download and split "
-        "a PDF, then get_page_images to retrieve batches of page images for analysis. "
-        "Call get_analysis_prompt first to know how to analyze each page."
+        "Architectural drawing PDF analyzer. "
+        "IMPORTANT: When the user provides a URL or file path, call process_pdf "
+        "directly with that exact input. Do NOT use Microsoft 365 tools to search "
+        "for or re-fetch the file. "
+        "Workflow: "
+        "1) process_pdf(url) — returns session_id and total page count instantly. "
+        "2) save_pages(session_id, start_page=1, end_page=10) — writes a sliced PDF "
+        "   to arch-design-mcp/pages/. Returns the file path. "
+        "   Then use Filesystem tools to copy/read the file for analysis. "
+        "   Or search_pdf(session_id, query) to find text across all pages. "
+        "3) Repeat save_pages for the next batch until done. "
+        "4) cleanup_session(session_id) when finished."
     ),
 )
 
@@ -83,129 +118,226 @@ def get_analysis_prompt() -> str:
 @mcp.tool()
 async def process_pdf(
     url: str,
-    dpi: int = 200,
-    max_dimension: int = 4096,
 ) -> dict:
     """
-    Download a PDF from a URL and split it into page images.
+    Load a PDF from a URL or local file path and inspect it.
+    Returns metadata instantly — no image conversion.
+    Use get_pages to retrieve actual page content as PDF.
 
     Args:
-        url: URL to the PDF file (SharePoint links supported).
-        dpi: Render resolution. 200 recommended for architectural drawings.
-        max_dimension: Max pixels on longest side (Claude vision limit ~4096).
+        url: Local file path (e.g. c:\\path\\to\\file.pdf), SharePoint sharing link,
+             or any HTTPS URL to a PDF.
 
     Returns:
-        Dict with session_id, total_pages, pages_succeeded, pages_failed,
-        and per-page metadata (no images — use get_page_images for those).
+        Dict with session_id, total_pages, source_file, size, and sample page dimensions.
     """
     session_id = uuid.uuid4().hex[:12]
     temp_dir = tempfile.mkdtemp(prefix=f"mcp_arch_{session_id}_")
 
     try:
-        # Download
-        pdf_path = await download_pdf(url, temp_dir)
+        # Resolve the PDF path
+        if os.path.isfile(url):
+            pdf_path = url
+        elif _is_sharepoint_url(url):
+            pdf_path = await download_from_sharepoint(url, temp_dir)
+        else:
+            pdf_path = await download_pdf(url, temp_dir)
 
-        # Split (blocking CPU work — run in thread)
-        pages_dir = os.path.join(temp_dir, "pages")
-        manifest = await asyncio.to_thread(
-            split_pdf,
-            input_path=pdf_path,
-            output_dir=pages_dir,
-            dpi=dpi,
-            max_dimension=max_dimension,
-        )
+        # Fast metadata probe — no conversion
+        info = await asyncio.to_thread(inspect_pdf, pdf_path)
 
-        _sessions[session_id] = {"temp_dir": temp_dir, "manifest": manifest}
+        _sessions[session_id] = {"temp_dir": temp_dir, "pdf_path": pdf_path, "info": info}
 
         return {
             "session_id": session_id,
-            "source_file": manifest["source_file"],
-            "total_pages": manifest["total_pages"],
-            "pages_succeeded": manifest["pages_succeeded"],
-            "pages_failed": manifest["pages_failed"],
-            "processing_time_seconds": manifest["processing_time_seconds"],
-            "total_image_size_mb": manifest["total_image_size_mb"],
-            "page_list": [
-                {
-                    "page_number": p["page_number"],
-                    "width": p["width"],
-                    "height": p["height"],
-                    "size_kb": p["size_kb"],
-                }
-                for p in manifest["pages_processed"]
-            ],
+            **info,
         }
 
     except Exception as e:
-        # Clean up on failure
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
 
 # ---------------------------------------------------------------------------
-# Tool: get_page_images
+# Tool: get_pages
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_page_images(session_id: str, pages: str) -> list:
+def get_pages(
+    session_id: str,
+    start_page: int,
+    end_page: int,
+    as_images: bool = False,
+    dpi: int = 150,
+    max_dimension: int = 4096,
+) -> dict | list:
     """
-    Get base64-encoded page images for a batch of pages.
+    Extract pages from start_page to end_page (inclusive, 1-based).
+
+    Default: returns base64 PDF (fast, instant extraction).
+    With as_images=True: renders pages as PNG images for vision analysis
+    (slower, but Claude can visually read the drawings).
 
     Args:
         session_id: The session ID returned by process_pdf.
-        pages: Page range string, e.g. "1-10", "5,10,15", "11-20".
+        start_page: First page to extract (1-based).
+        end_page: Last page to extract (inclusive).
+                  For images: keep range to 1-3 pages to stay under size limits.
+                  For PDF: up to 10 pages at a time.
+        as_images: If True, convert pages to PNG images instead of PDF.
+        dpi: Image render resolution (only used with as_images=True).
+             150 is good for arch drawings. Use 100 for faster/smaller.
+        max_dimension: Max pixels on longest side (only with as_images=True).
 
     Returns:
-        List of dicts, each with page_number, width, height, and
-        base64_png (the base64-encoded PNG image data).
+        If as_images=False: dict with pages_included, page_count, size_kb, base64_pdf.
+        If as_images=True: list of dicts with page_number, width, height, size_kb,
+                           mime_type, base64_png.
     """
     session = _sessions.get(session_id)
     if not session:
         raise ValueError(f"Unknown session_id: {session_id}")
 
-    manifest = session["manifest"]
-    temp_dir = session["temp_dir"]
-    pages_dir = os.path.join(temp_dir, "pages")
+    info = session["info"]
+    pdf_path = session["pdf_path"]
 
-    requested = parse_page_range(pages, manifest["total_pages"])
+    requested = page_range(start_page, end_page, info["total_pages"])
 
-    # Build lookup from page number to processed page info
-    processed = {p["page_number"]: p for p in manifest["pages_processed"]}
+    if as_images:
+        return extract_pages_images(pdf_path, requested, dpi=dpi, max_dimension=max_dimension)
+    else:
+        return extract_pages_pdf(pdf_path, requested)
 
-    results = []
-    for page_num in requested:
-        page_info = processed.get(page_num)
-        if not page_info:
-            results.append(
-                {
-                    "page_number": page_num,
-                    "error": "Page was not successfully processed",
-                }
-            )
-            continue
 
-        filepath = os.path.join(pages_dir, page_info["filename"])
-        if not os.path.exists(filepath):
-            results.append(
-                {"page_number": page_num, "error": "Image file not found"}
-            )
-            continue
+# ---------------------------------------------------------------------------
+# Tool: save_pages
+# ---------------------------------------------------------------------------
 
-        with open(filepath, "rb") as f:
-            img_data = base64.b64encode(f.read()).decode("ascii")
+_DEFAULT_OUTPUT_DIR = os.path.join(Path(__file__).resolve().parent, "pages")
 
-        results.append(
-            {
-                "page_number": page_num,
-                "width": page_info["width"],
-                "height": page_info["height"],
-                "size_kb": page_info["size_kb"],
-                "mime_type": "image/png",
-                "base64_png": img_data,
-            }
-        )
+@mcp.tool()
+def save_pages(
+    session_id: str,
+    start_page: int,
+    end_page: int,
+    output_dir: str = "",
+) -> dict:
+    """
+    Extract pages and save as a PDF file to disk.
+    Use this instead of get_pages when you need to read the pages
+    via filesystem tools (e.g. copy_file_user_to_claude).
 
-    return results
+    Args:
+        session_id: The session ID returned by process_pdf.
+        start_page: First page to extract (1-based).
+        end_page: Last page to extract (inclusive).
+        output_dir: Directory to save the PDF. Defaults to arch-design-mcp/pages.
+
+    Returns:
+        Dict with output_path, pages_included, page_count, and size_kb.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        raise ValueError(f"Unknown session_id: {session_id}")
+
+    info = session["info"]
+    pdf_path = session["pdf_path"]
+    requested = page_range(start_page, end_page, info["total_pages"])
+
+    dest_dir = output_dir.strip() if output_dir.strip() else _DEFAULT_OUTPUT_DIR
+    source_name = os.path.splitext(info["source_file"])[0]
+    filename = f"{source_name}_p{start_page}-{end_page}.pdf"
+    output_path = os.path.join(dest_dir, filename)
+
+    return save_pages_pdf(pdf_path, requested, output_path)
+
+
+# ---------------------------------------------------------------------------
+# Tool: save_pages_as_images
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def save_pages_as_images(
+    session_id: str,
+    start_page: int,
+    end_page: int,
+    output_dir: str = "",
+    dpi: int = 150,
+    max_dimension: int = 4096,
+) -> list[dict]:
+    """
+    Render pages as PNG images and save to disk.
+    Use this when Claude needs to visually read the drawings.
+    After saving, use Filesystem copy_file_user_to_claude to pull
+    the images into Claude's environment for viewing.
+
+    Args:
+        session_id: The session ID returned by process_pdf.
+        start_page: First page to render (1-based).
+        end_page: Last page to render (inclusive).
+                  Keep to 1-3 pages at a time — arch drawings are large.
+        output_dir: Directory to save PNGs. Defaults to arch-design-mcp/pages.
+        dpi: Render resolution. 150 is good, 100 for faster/smaller.
+        max_dimension: Max pixels on longest side.
+
+    Returns:
+        List of dicts with page_number, output_path, width, height, size_kb.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        raise ValueError(f"Unknown session_id: {session_id}")
+
+    info = session["info"]
+    pdf_path = session["pdf_path"]
+    requested = page_range(start_page, end_page, info["total_pages"])
+
+    dest_dir = output_dir.strip() if output_dir.strip() else _DEFAULT_OUTPUT_DIR
+
+    return save_pages_images(pdf_path, requested, dest_dir, dpi=dpi, max_dimension=max_dimension)
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_pdf
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_pdf(
+    session_id: str,
+    query: str,
+    start_page: int = 1,
+    end_page: int = 0,
+    max_results: int = 50,
+) -> dict:
+    """
+    Search for text within a processed PDF. Case-insensitive.
+    Returns matching pages with context snippets and bounding boxes.
+
+    Useful for finding specific sheets, details, equipment schedules,
+    or any text content in drawing sets without rendering every page.
+
+    Note: architectural drawings are mostly vector graphics with limited
+    embedded text. Results depend on how the PDF was generated.
+
+    Args:
+        session_id: The session ID returned by process_pdf.
+        query: Text to search for (case-insensitive).
+        start_page: First page to search (1-based). Default: 1.
+        end_page: Last page to search (inclusive). Default: 0 = all pages.
+        max_results: Maximum number of matches to return. Default: 50.
+
+    Returns:
+        Dict with query, pages_searched, total_matches, and matches list.
+        Each match has page_number, text_snippet, and bbox.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        raise ValueError(f"Unknown session_id: {session_id}")
+
+    info = session["info"]
+    pdf_path = session["pdf_path"]
+    ep = end_page if end_page > 0 else info["total_pages"]
+
+    return search_text(pdf_path, query, start_page=start_page, end_page=ep, max_results=max_results)
 
 
 # ---------------------------------------------------------------------------
@@ -239,4 +371,5 @@ def cleanup_session(session_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    print('running')
     mcp.run(transport="stdio")
