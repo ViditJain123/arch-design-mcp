@@ -156,15 +156,27 @@ No client secret is needed. The device code flow uses a "public client" — no s
 
 ### First Authentication
 
-The first time a SharePoint URL is passed to `process_pdf`, the server logs will show:
+Before using SharePoint links, authenticate once by opening a terminal and running:
 
 ```
-AUTHENTICATION REQUIRED
-  To sign in, use a web browser to open https://microsoft.com/devicelogin
-  and enter the code ABCD1234 to authenticate.
+cd %LOCALAPPDATA%\arch-design-mcp
+uv run python -m graph_auth
 ```
 
-After authenticating once, the token is cached at `~/.arch-design-mcp-token-cache.json` and refreshes silently. Users won't see the prompt again unless the refresh token expires (~90 days).
+This will automatically open your browser to the Microsoft sign-in page with the device code pre-filled. Just sign in with your Tocci account. The terminal will confirm:
+
+```
+Opening browser for sign-in...
+Waiting for sign-in to complete...
+
+Authenticated as: psavine@tocci.com
+Token cached at: C:\Users\psavine\.arch-design-mcp-token-cache.json
+You can now use SharePoint links in Claude.
+```
+
+The token refreshes silently for ~90 days. If it expires, Claude will tell you to run the auth command again.
+
+To clear the token cache: `uv run python -m graph_auth --clear`
 
 ### Security Notes
 
@@ -328,6 +340,6 @@ For non-technical users at Tocci:
 4. Copy `.env.example` to `.env`, fill in the Azure app credentials (same Client ID/Tenant ID for all users)
 5. Add the `mcpServers` config to `%APPDATA%\Claude\claude_desktop_config.json` (see Step 3 above — replace `YOUR_USERNAME`)
 6. Add `%LOCALAPPDATA%\arch-design-mcp` to Filesystem connector allowed directories
-7. First SharePoint use: user follows device code prompt in browser once
+7. First SharePoint use: run `cd %LOCALAPPDATA%\arch-design-mcp && uv run python -m graph_auth` in a terminal, follow the browser prompt once
 
 No Poppler install, no PATH configuration, no external binaries, no admin rights needed.

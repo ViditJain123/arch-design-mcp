@@ -77,47 +77,85 @@ def _get_app() -> tuple[msal.PublicClientApplication, msal.SerializableTokenCach
 
 def get_access_token() -> str:
     """
-    Get a valid Graph API access token.
+    Get a valid Graph API access token using cached/refreshed token only.
 
-    First tries silent acquisition (cached/refreshed token).
-    Falls back to device code flow if no cached token exists.
+    Does NOT initiate device code flow — that blocks the MCP server.
+    If no cached token exists, raises an error telling the user to run
+    the interactive auth command first.
 
     Returns:
         Access token string.
 
     Raises:
-        RuntimeError: If authentication fails.
+        RuntimeError: If no cached token or refresh fails.
     """
     app, cache = _get_app()
 
-    # Try silent first (cached token or refresh)
+    accounts = app.get_accounts()
+    if not accounts:
+        raise RuntimeError(
+            "Not authenticated to SharePoint. "
+            "Run this command in a terminal first:\n\n"
+            "  cd %LOCALAPPDATA%\\arch-design-mcp && uv run python -m graph_auth\n\n"
+            "Then retry the SharePoint link."
+        )
+
+    logger.info("Found cached account: %s", accounts[0].get("username", "unknown"))
+    result = app.acquire_token_silent(_SCOPES, account=accounts[0])
+
+    if result and "access_token" in result:
+        _save_cache(cache)
+        logger.info("Token acquired silently (cached/refreshed)")
+        return result["access_token"]
+
+    # Silent refresh failed — token expired beyond refresh window
+    _save_cache(cache)
+    raise RuntimeError(
+        "SharePoint token expired and could not be refreshed. "
+        "Run this command in a terminal to re-authenticate:\n\n"
+        "  cd %LOCALAPPDATA%\\arch-design-mcp && uv run python -m graph_auth\n\n"
+        "Then retry the SharePoint link."
+    )
+
+
+def interactive_auth() -> str:
+    """
+    Run the device code flow interactively in a terminal.
+    This is meant to be called from the CLI, not from the MCP server.
+
+    Returns:
+        The authenticated user's email/username.
+    """
+    app, cache = _get_app()
+
+    # Check if already authenticated
     accounts = app.get_accounts()
     if accounts:
-        logger.info("Found cached account: %s", accounts[0].get("username", "unknown"))
         result = app.acquire_token_silent(_SCOPES, account=accounts[0])
         if result and "access_token" in result:
             _save_cache(cache)
-            logger.info("Token acquired silently (cached/refreshed)")
-            return result["access_token"]
-        logger.info("Silent acquisition failed, falling back to device code flow")
+            username = accounts[0].get("username", "unknown")
+            print(f"Already authenticated as: {username}")
+            print(f"Token is valid. No action needed.")
+            return username
 
     # Device code flow
     flow = app.initiate_device_flow(scopes=_SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(f"Device code flow failed: {flow.get('error_description', 'unknown error')}")
 
-    # This message will appear in stderr (MCP logs)
-    logger.warning("=" * 60)
-    logger.warning("AUTHENTICATION REQUIRED")
-    logger.warning("  %s", flow["message"])
-    logger.warning("=" * 60)
+    # Open browser automatically with pre-filled code
+    import webbrowser
+    complete_uri = flow.get("verification_uri_complete", flow.get("verification_uri", ""))
+    if complete_uri:
+        print(f"\nOpening browser for sign-in...")
+        print(f"If the browser doesn't open, go to: {flow['verification_uri']}")
+        print(f"Enter code: {flow['user_code']}\n")
+        webbrowser.open(complete_uri)
+    else:
+        print(f"\n{flow['message']}\n")
 
-    # Also print to stderr directly so it's visible
-    import sys
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"AUTHENTICATION REQUIRED", file=sys.stderr)
-    print(f"  {flow['message']}", file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
+    print("Waiting for sign-in to complete...")
 
     # This blocks until user completes auth in browser
     result = app.acquire_token_by_device_flow(flow)
@@ -127,9 +165,11 @@ def get_access_token() -> str:
         raise RuntimeError(f"Authentication failed: {error}")
 
     _save_cache(cache)
-    logger.info("Token acquired via device code flow for: %s",
-                result.get("id_token_claims", {}).get("preferred_username", "unknown"))
-    return result["access_token"]
+    username = result.get("id_token_claims", {}).get("preferred_username", "unknown")
+    print(f"\nAuthenticated as: {username}")
+    print(f"Token cached at: {_CACHE_PATH}")
+    print(f"You can now use SharePoint links in Claude.")
+    return username
 
 
 def clear_cache() -> str:
@@ -138,3 +178,19 @@ def clear_cache() -> str:
         os.remove(_CACHE_PATH)
         return f"Token cache cleared: {_CACHE_PATH}"
     return "No token cache found."
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--clear":
+        print(clear_cache())
+    else:
+        try:
+            interactive_auth()
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
